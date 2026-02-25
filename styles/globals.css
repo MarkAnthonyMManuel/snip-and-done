@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* This ensures the background matches our theme even if things lag */
+body {
+    @apply bg-orange-50/30 text-slate-900;
+}
