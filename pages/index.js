@@ -1,374 +1,540 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Head from 'next/head';
 import { supabase } from '../lib/supabase';
 import {
-    Search, Plus, Copy, Tag, Settings as SettingsIcon,
-    LayoutDashboard, Bookmark, Trash2, X, Save, Edit3, Clock, Sun, Moon, RotateCcw, Download, Upload
+    Search, Plus, Copy, Settings as SettingsIcon,
+    LayoutDashboard, Bookmark, Trash2, Save, Edit3,
+    Sun, Moon, Download, Upload,
+    LogOut, Mail, Lock, Eye, EyeOff, ChevronLeft, ChevronRight, CheckCircle
 } from 'lucide-react';
 
+function extractVars(text) {
+    const matches = text.match(/{{\s*([^}]+?)\s*}}/g) ?? [];
+    const vars = matches.map(m => m.replace(/{{|}}/g, '').trim());
+    return Array.from(new Set(vars));
+}
+
+function safeParseJSON(raw) {
+    try {
+        return { ok: true, value: JSON.parse(raw) };
+    } catch {
+        return { ok: false, error: 'Invalid JSON file.' };
+    }
+}
+
+function applyVars(text, values) {
+    return text.replace(/{{\s*([^}]+?)\s*}}/g, (_m, rawKey) => {
+        const key = String(rawKey).trim();
+        const v = (values[key] ?? '').trim();
+        return v !== '' ? v : `[${key}]`;
+    });
+}
+
 export default function CannedNotesApp() {
-    // --- STATE MANAGEMENT ---
     const [mounted, setMounted] = useState(false);
-    const [view, setView] = useState('notes');
+
+    const [user, setUser] = useState(null);
+    const [authEmail, setAuthEmail] = useState('');
+    const [authPassword, setAuthPassword] = useState('');
+    const [showPassword, setShowPassword] = useState(false);
+
+    const [view, setView] = useState('notes'); // 'notes' | 'pinned' | 'settings'
     const [notes, setNotes] = useState([]);
-    const [frequentNotes, setFrequentNotes] = useState([]);
     const [search, setSearch] = useState('');
+
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
     const [editingNote, setEditingNote] = useState(null);
+
     const [activeNoteForVars, setActiveNoteForVars] = useState(null);
     const [varValues, setVarValues] = useState({});
+
     const [signature, setSignature] = useState('');
     const [isDark, setIsDark] = useState(false);
 
-    // --- INITIALIZATION ---
+    const [showToast, setShowToast] = useState(false);
+    const toastTimer = useRef(null);
+
+    const [isSavingSig, setIsSavingSig] = useState(false);
+
     useEffect(() => {
         setMounted(true);
+
         const localDark = localStorage.getItem('dark_mode') === 'true';
         setIsDark(localDark);
-        fetchData();
+
+        supabase.auth.getSession().then(({ data, error }) => {
+            if (error) return;
+            setUser(data.session?.user ?? null);
+        });
+
+        const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+            setUser(session?.user ?? null);
+        });
+
+        return () => {
+            listener.subscription.unsubscribe();
+            if (toastTimer.current) window.clearTimeout(toastTimer.current);
+        };
     }, []);
 
+    useEffect(() => {
+        if (!user?.id) return;
+        void fetchData();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [user?.id]);
+
     const fetchData = async () => {
-        const { data: allNotes } = await supabase.from('notes').select('*').order('is_pinned', { ascending: false });
-        const { data: sigData } = await supabase.from('signatures').select('content').single();
-        if (allNotes) {
-            setNotes(allNotes);
-            const topPicks = [...allNotes]
-                .filter(n => (n.usage_count || 0) > 0)
-                .sort((a, b) => b.usage_count - a.usage_count)
-                .slice(0, 3);
-            setFrequentNotes(topPicks);
+        if (!user?.id) return;
+
+        const { data: allNotes, error: notesErr } = await supabase
+            .from('notes')
+            .select('*')
+            .eq('user_id', user.id)
+            .order('is_pinned', { ascending: false })
+            .order('created_at', { ascending: false });
+
+        if (notesErr) {
+            console.error(notesErr);
+            alert(`Failed to load notes: ${notesErr.message}`);
+            return;
         }
-        if (sigData) setSignature(sigData.content);
+
+        const { data: sigData, error: sigErr } = await supabase
+            .from('signatures')
+            .select('content')
+            .eq('user_id', user.id)
+            .maybeSingle();
+
+        if (sigErr) console.error(sigErr);
+
+        setNotes(allNotes ?? []);
+        setSignature(sigData?.content ?? '');
     };
 
-    // --- BACKUP LOGIC ---
-    const exportData = () => {
-        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(notes));
-        const downloadAnchorNode = document.createElement('a');
-        downloadAnchorNode.setAttribute("href", dataStr);
-        downloadAnchorNode.setAttribute("download", `snip_done_backup_${new Date().toISOString().slice(0, 10)}.json`);
-        document.body.appendChild(downloadAnchorNode);
-        downloadAnchorNode.click();
-        downloadAnchorNode.remove();
+    const handleLogin = async (e) => {
+        e.preventDefault();
+        const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+        if (error) alert(error.message);
     };
 
-    const importData = async (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = async (event) => {
-            try {
-                const importedNotes = JSON.parse(event.target.result);
-                const cleanNotes = importedNotes.map(({ id, created_at, ...rest }) => rest);
-                await supabase.from('notes').insert(cleanNotes);
-                fetchData();
-                alert("Backup restored! 🍊");
-            } catch (err) {
-                alert("Invalid JSON file.");
-            }
-        };
-        reader.readAsText(file);
+    const handleLogout = async () => {
+        await supabase.auth.signOut();
+        setNotes([]);
+        setSignature('');
+        setView('notes');
     };
 
-    // --- ACTIONS ---
     const toggleDarkMode = () => {
         const newDark = !isDark;
         setIsDark(newDark);
-        localStorage.setItem('dark_mode', newDark);
+        localStorage.setItem('dark_mode', String(newDark));
+    };
+
+    const exportData = () => {
+        const payload = {
+            exported_at: new Date().toISOString(),
+            notes,
+            signature,
+        };
+
+        const dataStr = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(payload, null, 2));
+        const a = document.createElement('a');
+        a.href = dataStr;
+        a.download = `snip_done_backup_${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    };
+
+    const importData = async (e) => {
+        const file = e.target.files?.[0];
+        if (!file || !user?.id) return;
+
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+            const raw = String(event.target?.result ?? '');
+            const parsed = safeParseJSON(raw);
+            if (!parsed.ok) return alert(parsed.error);
+
+            const incomingNotes = Array.isArray(parsed.value?.notes) ? parsed.value.notes : parsed.value;
+            if (!Array.isArray(incomingNotes)) return alert('Backup format not recognized.');
+
+            const cleanNotes = incomingNotes
+                .filter((n) => n && typeof n.title === 'string' && typeof n.content === 'string')
+                .map((n) => {
+                    const tags = Array.isArray(n.tags) ? n.tags.map((t) => String(t).trim()).filter(Boolean) : [];
+                    return {
+                        title: n.title,
+                        content: n.content,
+                        tags,
+                        is_pinned: Boolean(n.is_pinned),
+                        usage_count: typeof n.usage_count === 'number' ? n.usage_count : 0,
+                        user_id: user.id,
+                    };
+                });
+
+            if (cleanNotes.length === 0) return alert('No valid notes found in backup.');
+
+            const { error } = await supabase.from('notes').insert(cleanNotes);
+            if (error) {
+                console.error(error);
+                return alert(`Import failed: ${error.message}`);
+            }
+
+            const sig = typeof parsed.value?.signature === 'string' ? parsed.value.signature : null;
+            if (sig !== null) {
+                await supabase.from('signatures').upsert({ user_id: user.id, content: sig }, { onConflict: 'user_id' });
+            }
+
+            await fetchData();
+            alert('Backup restored! 🍊');
+            e.target.value = '';
+        };
+
+        reader.readAsText(file);
     };
 
     const handleCopyRequest = (note) => {
-        const vars = note.content.match(/{{(.*?)}}/g)?.map(v => v.replace(/{{|}}/g, '')) || [];
+        const vars = extractVars(note.content);
         if (vars.length > 0) {
             setActiveNoteForVars({ ...note, vars });
+            setVarValues({});
         } else {
-            finalizeCopy(note.id, note.content, note.usage_count);
+            void finalizeCopy(note.id, note.content, note.usage_count ?? 0);
         }
     };
 
     const finalizeCopy = async (noteId, text, currentCount) => {
-        await supabase.from('notes').update({ usage_count: (currentCount || 0) + 1 }).eq('id', noteId);
-        let processed = text;
-        Object.entries(varValues).forEach(([k, v]) => {
-            processed = processed.replaceAll(`{{${k}}}`, v || `[${k}]`);
-        });
-        navigator.clipboard.writeText(`${processed}\n\n${signature}`);
+        if (!user?.id) return;
+
+        const processed = applyVars(text, varValues);
+        await navigator.clipboard.writeText(`${processed}\n\n${signature}`.trim());
+
+        const { error } = await supabase
+            .from('notes')
+            .update({ usage_count: currentCount + 1 })
+            .eq('id', noteId)
+            .eq('user_id', user.id);
+
+        if (error) console.error(error);
+
+        setShowToast(true);
+        if (toastTimer.current) window.clearTimeout(toastTimer.current);
+        toastTimer.current = window.setTimeout(() => setShowToast(false), 2000);
+
         setActiveNoteForVars(null);
         setVarValues({});
-        fetchData();
-        alert("Copied to clipboard! 🍊");
+        await fetchData();
     };
 
-    const handleSaveNote = async (e) => {
-        e.preventDefault();
-        const formData = new FormData(e.target);
-        const noteData = {
-            title: formData.get('title'),
-            content: formData.get('content'),
-            tags: formData.get('tags').split(',').map(t => t.trim()).filter(t => t !== ""),
-        };
+    const filteredNotes = useMemo(() => {
+        const q = search.trim().toLowerCase();
 
-        if (editingNote) {
-            await supabase.from('notes').update(noteData).eq('id', editingNote.id);
-        } else {
-            await supabase.from('notes').insert([{ ...noteData, is_pinned: false, usage_count: 0 }]);
-        }
-        setEditingNote(null);
-        setIsDrawerOpen(false);
-        fetchData();
-    };
+        return notes
+            .filter((n) => (view === 'pinned' ? n.is_pinned : true))
+            .filter((n) => {
+                if (!q) return true;
+                const hay = [n.title ?? '', n.content ?? '', ...(n.tags ?? [])].join(' ').toLowerCase();
+                return hay.includes(q);
+            });
+    }, [notes, search, view]);
 
-    // --- HYDRATION GUARD ---
     if (!mounted) return null;
 
-    const displayNotes = notes.filter(n => {
-        const matchesSearch = n.title.toLowerCase().includes(search.toLowerCase()) ||
-            n.tags?.some(t => t.toLowerCase().includes(search.toLowerCase()));
-        if (view === 'pinned') return n.is_pinned && matchesSearch;
-        return matchesSearch;
-    });
+    if (!user) {
+        return (
+            <div className={`auth-page ${isDark ? 'dark' : ''}`}>
+                <div className="auth-card">
+                    <div className="auth-header">
+                        <div className="auth-logo">SNIP<span>&</span>DONE</div>
+                        <h1>Agent Login</h1>
+                        <p>Access your templates</p>
+                    </div>
+
+                    <form className="auth-form" onSubmit={handleLogin}>
+                        <div className="field">
+                            <label><Mail size={14} /> Email Address</label>
+                            <input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} required />
+                        </div>
+
+                        <div className="field">
+                            <label><Lock size={14} /> Password</label>
+                            <div className="password-wrapper">
+                                <input
+                                    type={showPassword ? 'text' : 'password'}
+                                    value={authPassword}
+                                    onChange={(e) => setAuthPassword(e.target.value)}
+                                    required
+                                />
+                                <button type="button" className="eye-btn" onClick={() => setShowPassword(!showPassword)}>
+                                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                                </button>
+                            </div>
+                        </div>
+
+                        <button type="submit" className="login-submit-btn">Sign In</button>
+                    </form>
+                </div>
+
+                <style jsx>{`
+          .auth-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); padding: 40px 20px; box-sizing: border-box; }
+          .auth-card { background: var(--side); padding: 50px 40px; border-radius: 32px; width: 100%; max-width: 400px; border: 1px solid var(--border); text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+          .auth-logo { font-size: 28px; font-weight: 900; margin-bottom: 8px; font-style: italic; }
+          .auth-logo span { color: #f97316; }
+          .auth-form { display: flex; flex-direction: column; gap: 20px; text-align: left; margin-top: 30px; }
+          .field label { display: block; font-size: 11px; font-weight: 700; color: #f97316; text-transform: uppercase; margin-bottom: 8px; }
+          .field input { width: 100%; padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline: none; }
+          .password-wrapper { position: relative; }
+          .eye-btn { position: absolute; right: 12px; top: 12px; background: none; border: none; color: var(--dim); cursor: pointer; }
+          .login-submit-btn { background: #f97316; color: white; border: none; padding: 16px; border-radius: 14px; font-weight: 700; cursor: pointer; margin-top: 10px; }
+        `}</style>
+            </div>
+        );
+    }
 
     return (
         <div className={`app-wrapper ${isDark ? 'dark' : ''}`}>
             <Head><title>Snip & Done</title></Head>
 
-            <div className="app-container">
-                {/* SIDEBAR */}
-// ... inside your return statement ...
-
-                <aside className="sidebar">
-                    <div className="sidebar-top">
-                        <div className="logo">SNIP&DONE</div>
-                        <nav className="nav-group">
-                            <button className={`nav-btn ${view === 'notes' ? 'active' : ''}`} onClick={() => setView('notes')}>
-                                <LayoutDashboard size={18} /> Library
-                            </button>
-                            <button className={`nav-btn ${view === 'pinned' ? 'active' : ''}`} onClick={() => setView('pinned')}>
-                                <Bookmark size={18} /> Favorites
-                            </button>
-                            <button className={`nav-btn ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
-                                <SettingsIcon size={18} /> Settings
-                            </button>
-                        </nav>
-                    </div>
-
-                    <div className="sidebar-bottom">
-                        <button className="theme-toggle" onClick={toggleDarkMode}>
-                            {isDark ? <Sun size={18} /> : <Moon size={18} />}
-                            <span>{isDark ? 'Light' : 'Dark'} Mode</span>
+            <aside className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
+                <div className="sidebar-top">
+                    <div className="logo-container">
+                        <div className="logo">{isSidebarCollapsed ? <span>S</span> : <>SNIP<span>&</span>DONE</>}</div>
+                        <button className="collapse-toggle" onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}>
+                            {isSidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
                         </button>
                     </div>
-                </aside>
-                {/* MAIN CONTENT */}
-                <main className="main-content">
-                    {view === 'settings' ? (
-                        <div className="view-animate">
-                            <h1 className="view-title">Settings</h1>
-                            <div className="settings-card">
-                                <div className="setting-item">
-                                    <label className="field-label">Universal Signature</label>
-                                    <textarea
-                                        className="sig-textarea"
-                                        value={signature}
-                                        onChange={(e) => setSignature(e.target.value)}
-                                        rows="6"
-                                        placeholder="Best Regards, Mark..."
-                                    />
-                                    <button className="primary-btn" onClick={async () => {
-                                        await supabase.from('signatures').upsert({ id: 1, content: signature });
-                                        alert("Signature saved!");
-                                    }}><Save size={18} /> Save Signature</button>
-                                </div>
 
-                                <div className="setting-item border-top">
-                                    <label className="field-label">Backup & Recovery</label>
-                                    <p className="dim-text">Keep a local copy of your snippets or restore them from a file.</p>
-                                    <div className="action-row">
-                                        <button className="outline-btn" onClick={exportData}>
-                                            <Download size={18} /> Export JSON
-                                        </button>
-                                        <label className="outline-btn cursor-pointer">
-                                            <Upload size={18} /> Import Backup
-                                            <input type="file" hidden accept=".json" onChange={importData} />
-                                        </label>
-                                    </div>
-                                </div>
+                    <nav className="nav-group">
+                        <button className={`nav-btn ${view === 'notes' ? 'active' : ''}`} onClick={() => setView('notes')}>
+                            <div className="nav-icon-box"><LayoutDashboard size={18} /></div>
+                            {!isSidebarCollapsed && <span>Library</span>}
+                        </button>
 
-                                <div className="setting-item border-top">
-                                    <label className="field-label">Danger Zone</label>
-                                    <button className="outline-btn danger" onClick={async () => {
-                                        if (confirm("Reset usage stats?")) {
-                                            await supabase.from('notes').update({ usage_count: 0 }).neq('id', 0);
-                                            fetchData();
-                                        }
-                                    }}><RotateCcw size={18} /> Reset All Statistics</button>
-                                </div>
-                            </div>
-                        </div>
-                    ) : (
-                        <div className="view-animate">
-                            <header className="main-header">
-                                <h1 className="view-title">{view.toUpperCase()} <span className="orange-text">SNIPPETS</span></h1>
-                                <button className="primary-btn" onClick={() => { setEditingNote(null); setIsDrawerOpen(true); }}><Plus size={20} /> New Template</button>
-                            </header>
+                        <button className={`nav-btn ${view === 'pinned' ? 'active' : ''}`} onClick={() => setView('pinned')}>
+                            <div className="nav-icon-box"><Bookmark size={18} /></div>
+                            {!isSidebarCollapsed && <span>Favorites</span>}
+                        </button>
 
-                            {view === 'notes' && frequentNotes.length > 0 && !search && (
-                                <div className="frequent-container">
-                                    <div className="label-row"><Clock size={14} /> Frequently Used</div>
-                                    <div className="frequent-grid">
-                                        {frequentNotes.map(n => (
-                                            <div key={n.id} className="mini-card" onClick={() => handleCopyRequest(n)}>
-                                                <span className="mini-title">{n.title}</span>
-                                                <span className="mini-badge">{n.usage_count}x</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
+                        <button className={`nav-btn ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
+                            <div className="nav-icon-box"><SettingsIcon size={18} /></div>
+                            {!isSidebarCollapsed && <span>Settings</span>}
+                        </button>
 
-                            <div className="search-box">
-                                <Search className="search-icon" size={20} />
-                                <input className="search-input" placeholder="Search by name or keyword..." onChange={(e) => setSearch(e.target.value)} />
-                            </div>
+                        <div className="nav-divider" />
 
-                            <div className="notes-grid">
-                                {displayNotes.map(note => (
-                                    <div key={note.id} className={`note-card ${note.is_pinned ? 'pinned' : ''}`}>
-                                        <div className="card-top">
-                                            <div>
-                                                <h3>{note.title}</h3>
-                                                <span className="card-date">Modified {new Date(note.created_at).toLocaleDateString()}</span>
-                                            </div>
-                                            <div className="card-actions">
-                                                <button onClick={async () => {
-                                                    await supabase.from('notes').update({ is_pinned: !note.is_pinned }).eq('id', note.id);
-                                                    fetchData();
-                                                }} className={note.is_pinned ? 'orange-text' : ''}><Bookmark size={16} /></button>
-                                                <button onClick={() => { setEditingNote(note); setIsDrawerOpen(true); }}><Edit3 size={16} /></button>
-                                                <button onClick={async () => { if (confirm("Delete?")) { await supabase.from('notes').delete().eq('id', note.id); fetchData(); } }} className="text-red"><Trash2 size={16} /></button>
-                                            </div>
-                                        </div>
-                                        <p className="card-body">{note.content}</p>
-                                        <div className="card-bottom">
-                                            <div className="tag-list">{note.tags?.map(t => <span key={t} className="tag-chip">{t}</span>)}</div>
-                                            <button className="copy-action-btn" onClick={() => handleCopyRequest(note)}><Copy size={16} /> Copy</button>
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    )}
-                </main>
-            </div>
+                        <button className="nav-btn" onClick={toggleDarkMode}>
+                            <div className="nav-icon-box">{isDark ? <Sun size={18} /> : <Moon size={18} />}</div>
+                            {!isSidebarCollapsed && <span>Theme</span>}
+                        </button>
 
-            {/* MODALS */}
-            {isDrawerOpen && (
-                <div className="overlay" onClick={() => setIsDrawerOpen(false)}>
-                    <div className="drawer" onClick={e => e.stopPropagation()}>
-                        <div className="drawer-header">
-                            <h2>{editingNote ? 'Modify Template' : 'New Template'}</h2>
-                            <button onClick={() => setIsDrawerOpen(false)}><X /></button>
-                        </div>
-                        <form onSubmit={handleSaveNote} className="drawer-form">
-                            <div className="field">
-                                <label>Template Title</label>
-                                <input name="title" defaultValue={editingNote?.title} required placeholder="e.g. Greeting" />
-                            </div>
-                            <div className="field">
-                                <label>Content (Use {"{{variable}}"} )</label>
-                                <textarea name="content" defaultValue={editingNote?.content} rows="10" required />
-                            </div>
-                            <div className="field">
-                                <label>Tags (commas)</label>
-                                <input name="tags" defaultValue={editingNote?.tags?.join(', ')} />
-                            </div>
-                            <button type="submit" className="primary-btn wide">{editingNote ? 'Save Changes' : 'Create Template'}</button>
-                        </form>
-                    </div>
+                        <button className="nav-btn logout-red" onClick={handleLogout}>
+                            <div className="nav-icon-box"><LogOut size={18} /></div>
+                            {!isSidebarCollapsed && <span>Sign Out</span>}
+                        </button>
+                    </nav>
                 </div>
-            )}
+            </aside>
+
+            <main className={`main-content ${isSidebarCollapsed ? 'expanded' : ''}`}>
+                {view === 'settings' ? (
+                    <div className="view-animate">
+                        <h1 className="view-title">Settings</h1>
+
+                        <div className="settings-card">
+                            <div className="setting-item">
+                                <label className="field-label">Universal Signature</label>
+                                <textarea className="sig-textarea" value={signature} onChange={(e) => setSignature(e.target.value)} rows={6} />
+
+                                <button
+                                    className="primary-btn"
+                                    disabled={isSavingSig}
+                                    onClick={async () => {
+                                        setIsSavingSig(true);
+                                        const { error } = await supabase
+                                            .from('signatures')
+                                            .upsert({ user_id: user.id, content: signature }, { onConflict: 'user_id' });
+                                        setIsSavingSig(false);
+                                        if (error) return alert(`Signature save failed: ${error.message}`);
+                                        alert('Signature saved!');
+                                    }}
+                                >
+                                    <Save size={18} /> {isSavingSig ? 'Saving...' : 'Save Signature'}
+                                </button>
+                            </div>
+
+                            <div className="setting-item border-top">
+                                <label className="field-label">Backup & Recovery</label>
+                                <div className="action-row">
+                                    <button className="outline-btn" onClick={exportData}><Download size={18} /> Export JSON</button>
+                                    <label className="outline-btn cursor-pointer">
+                                        <Upload size={18} /> Import Backup
+                                        <input type="file" hidden accept=".json" onChange={importData} />
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="view-animate">
+                        <header className="main-header">
+                            <h1 className="view-title">{view.toUpperCase()} <span className="orange-text">SNIPPETS</span></h1>
+                            <button className="primary-btn" onClick={() => { setEditingNote(null); setIsDrawerOpen(true); }}>
+                                <Plus size={20} /> New Template
+                            </button>
+                        </header>
+
+                        <div className="search-box">
+                            <Search className="search-icon" size={20} />
+                            <input
+                                className="search-input"
+                                placeholder="Search title, content, tags..."
+                                value={search}
+                                onChange={(e) => setSearch(e.target.value)}
+                            />
+                        </div>
+
+                        <div className="notes-grid">
+                            {filteredNotes.map(note => (
+                                <div key={note.id} className={`note-card ${note.is_pinned ? 'pinned' : ''}`}>
+                                    <div className="card-top">
+                                        <h3>{note.title}</h3>
+                                        <div className="card-actions">
+                                            <button
+                                                onClick={async () => {
+                                                    const { error } = await supabase
+                                                        .from('notes')
+                                                        .update({ is_pinned: !note.is_pinned })
+                                                        .eq('id', note.id)
+                                                        .eq('user_id', user.id);
+                                                    if (error) return alert(`Pin failed: ${error.message}`);
+                                                    await fetchData();
+                                                }}
+                                                className={note.is_pinned ? 'orange-text' : ''}
+                                                title="Toggle favorite"
+                                            >
+                                                <Bookmark size={16} />
+                                            </button>
+
+                                            <button onClick={() => { setEditingNote(note); setIsDrawerOpen(true); }} title="Edit">
+                                                <Edit3 size={16} />
+                                            </button>
+
+                                            <button
+                                                onClick={async () => {
+                                                    if (!confirm('Delete?')) return;
+                                                    const { error } = await supabase.from('notes').delete().eq('id', note.id).eq('user_id', user.id);
+                                                    if (error) return alert(`Delete failed: ${error.message}`);
+                                                    await fetchData();
+                                                }}
+                                                className="text-red"
+                                                title="Delete"
+                                            >
+                                                <Trash2 size={16} />
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <p className="card-body">{note.content}</p>
+
+                                    <div className="card-bottom">
+                                        <div className="tag-list">
+                                            {(note.tags ?? []).map(t => <span key={t} className="tag-chip">{t}</span>)}
+                                        </div>
+                                        <button className="copy-action-btn" onClick={() => handleCopyRequest(note)}>
+                                            <Copy size={16} /> Copy
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </main>
 
             {activeNoteForVars && (
                 <div className="overlay">
                     <div className="variable-modal">
-                        <h2>Complete Snippet</h2>
-                        {activeNoteForVars.vars.map(v => (
+                        <h2>Complete Variables</h2>
+                        {activeNoteForVars.vars.map((v, i) => (
                             <div key={v} className="field">
                                 <label>{v}</label>
-                                <input autoFocus onChange={(e) => setVarValues({ ...varValues, [v]: e.target.value })} />
+                                <input
+                                    autoFocus={i === 0}
+                                    value={varValues[v] ?? ''}
+                                    onChange={(e) => setVarValues(prev => ({ ...prev, [v]: e.target.value }))}
+                                />
                             </div>
                         ))}
-                        <button className="primary-btn wide" onClick={() => finalizeCopy(activeNoteForVars.id, activeNoteForVars.content, activeNoteForVars.usage_count)}>Finalize & Copy</button>
-                        <button className="cancel-btn" onClick={() => setActiveNoteForVars(null)}>Cancel</button>
+                        <button
+                            className="primary-btn wide"
+                            onClick={() => finalizeCopy(activeNoteForVars.id, activeNoteForVars.content, activeNoteForVars.usage_count ?? 0)}
+                        >
+                            Finalize & Copy
+                        </button>
                     </div>
                 </div>
             )}
 
+            {showToast && <div className="toast"><CheckCircle size={16} /> Copied to clipboard! 🍊</div>}
+
             <style jsx global>{`
         :root { --bg: #fffaf5; --side: #ffffff; --card: #ffffff; --text: #2d3748; --dim: #718096; --border: #edf2f7; --in: #ffffff; }
         .dark { --bg: #0b0e14; --side: #151921; --card: #1c212c; --text: #e2e8f0; --dim: #94a3b8; --border: #2d3748; --in: #0b0e14; }
-
         body { margin: 0; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); }
-        .app-container { display: flex; min-height: 100vh; }
-        
-        /* Sidebar */
-        .sidebar { width: 280px; background: var(--side); border-right: 1px solid var(--border); padding: 30px; display: flex; flex-direction: column; position: fixed; height: 100vh; z-index: 100; }
-        .logo { font-size: 28px; font-weight: 900; color: #f97316; margin-bottom: 50px; font-style: italic; }
-        .nav-btn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 14px 18px; border: none; background: none; font-weight: 700; color: var(--dim); cursor: pointer; border-radius: 14px; margin-bottom: 10px; }
-        .nav-btn.active { background: #f97316; color: white; box-shadow: 0 10px 20px -5px rgba(249, 115, 22, 0.4); }
-        .theme-toggle { margin-top: auto; border: 1px solid var(--border); background: var(--in); color: var(--text); padding: 12px; border-radius: 12px; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 10px; }
-
-        /* Content Area */
-        .main-content { flex: 1; margin-left: 280px; padding: 60px; max-width: 1200px; }
-        .view-title { font-size: 32px; font-weight: 900; margin: 0; }
-        .orange-text { color: #f97316; }
-        .main-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 40px; }
-
-        /* Frequent */
-        .frequent-container { margin-bottom: 40px; }
-        .label-row { font-size: 11px; font-weight: 900; color: #f97316; text-transform: uppercase; margin-bottom: 15px; display: flex; align-items: center; gap: 6px; }
-        .frequent-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
-        .mini-card { background: var(--card); border: 1px solid var(--border); padding: 16px; border-radius: 16px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
-        .mini-badge { background: rgba(249, 115, 22, 0.1); color: #f97316; font-size: 10px; padding: 3px 8px; border-radius: 8px; font-weight: 900; }
-
-        /* Search & Grid */
-        .search-box { position: relative; margin-bottom: 40px; }
-        .search-input { width: 100%; padding: 18px 20px 18px 55px; border-radius: 20px; border: 2px solid var(--border); background: var(--card); color: var(--text); outline: none; }
-        .search-icon { position: absolute; left: 20px; top: 20px; color: #f97316; }
-
-        .notes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 25px; }
-        .note-card { background: var(--card); border: 1px solid var(--border); padding: 25px; border-radius: 28px; display: flex; flex-direction: column; transition: 0.2s; }
-        .note-card:hover { border-color: #f97316; transform: translateY(-4px); }
-        .note-card.pinned { border-top: 6px solid #f97316; }
-        .card-body { color: var(--dim); font-size: 14px; line-height: 1.6; margin: 15px 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        .card-bottom { margin-top: auto; padding-top: 20px; display: flex; justify-content: space-between; align-items: center; }
-        .tag-chip { background: var(--bg); color: #f97316; font-size: 10px; font-weight: 900; padding: 4px 10px; border-radius: 8px; margin-right: 5px; text-transform: uppercase; }
-        .copy-action-btn { background: #f97316; color: white; border: none; padding: 10px 20px; border-radius: 12px; font-weight: 800; cursor: pointer; }
-
-        /* Settings */
-        .settings-card { background: var(--card); border: 1px solid var(--border); border-radius: 28px; padding: 40px; }
-        .field-label { display: block; font-weight: 900; color: #f97316; text-transform: uppercase; font-size: 12px; margin-bottom: 15px; }
-        .sig-textarea { width: 100%; background: var(--in); color: var(--text); border: 2px solid var(--border); border-radius: 16px; padding: 20px; font-family: 'Courier New', monospace; font-size: 14px; margin-bottom: 20px; outline: none; box-sizing: border-box; }
-        .action-row { display: flex; gap: 15px; }
-        .border-top { border-top: 1px solid var(--border); padding-top: 30px; margin-top: 30px; }
-
-        /* Buttons & Modals */
-        .primary-btn { background: #f97316; color: white; border: none; padding: 12px 24px; border-radius: 16px; font-weight: 800; cursor: pointer; display: flex; align-items: center; gap: 8px; }
-        .primary-btn.wide { width: 100%; justify-content: center; }
-        .outline-btn { background: none; border: 1px solid var(--border); color: var(--text); padding: 12px 20px; border-radius: 12px; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 8px; }
-        .outline-btn.danger:hover { color: #ef4444; border-color: #ef4444; }
-        .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(5px); z-index: 1000; display: flex; align-items: center; justify-content: center; }
-        .drawer { position: absolute; right: 0; height: 100vh; background: var(--side); width: 480px; padding: 40px; box-shadow: -20px 0 50px rgba(0,0,0,0.2); }
-        .variable-modal { background: var(--card); padding: 40px; border-radius: 32px; width: 450px; border-top: 10px solid #f97316; }
-        .field label { display: block; font-size: 12px; font-weight: 900; color: #f97316; text-transform: uppercase; margin-bottom: 8px; }
-        .field input, .field textarea { width: 100%; padding: 14px; background: var(--in); border: 2px solid var(--border); border-radius: 12px; color: var(--text); outline: none; }
-        .cancel-btn { background: none; border: none; color: var(--dim); width: 100%; margin-top: 15px; cursor: pointer; }
-        .cursor-pointer { cursor: pointer; }
-        .text-red { color: #ef4444; }
-
-        .view-animate { animation: slideUp 0.3s ease-out; }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .sidebar { width: 260px; height: 100vh; position: fixed; background: var(--side); border-right: 1px solid var(--border); padding: 25px; transition: 0.3s; z-index: 100; }
+        .sidebar.collapsed { width: 80px; padding: 25px 10px; }
+        .logo-container { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom: 40px; }
+        .logo { font-weight: 900; font-size: 22px; color: #f97316; font-style: italic; }
+        .logo span { color: #111827; }
+        .dark .logo span { color: #e2e8f0; }
+        .collapse-toggle { border:none; background:transparent; cursor:pointer; color: var(--dim); padding: 8px; border-radius: 10px; }
+        .nav-group { display: flex; flex-direction: column; gap: 10px; }
+        .nav-divider { height:1px; background: var(--border); margin: 8px 0; }
+        .nav-btn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px; border: none; background: transparent; border-radius: 12px; cursor: pointer; color: var(--dim); font-weight: 700; }
+        .nav-btn.active { color: white; background: #f97316; }
+        .logout-red { color: #ef4444; margin-top: 20px; }
+        .main-content { margin-left: 260px; padding: 60px; transition: 0.3s; }
+        .main-content.expanded { margin-left: 80px; }
+        .main-header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom: 18px; }
+        .view-title { margin: 0; font-size: 28px; letter-spacing: 0.5px; }
+        .orange-text { color:#f97316; }
+        .primary-btn { background: #f97316; color: white; border: none; padding: 12px 16px; border-radius: 14px; font-weight: 800; cursor: pointer; display:flex; align-items:center; gap:10px; }
+        .primary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .outline-btn { border: 2px solid var(--border); background: transparent; color: var(--text); padding: 12px 16px; border-radius: 14px; font-weight: 800; cursor: pointer; display:flex; align-items:center; gap:10px; }
+        .search-box { position: relative; margin: 18px 0 26px; }
+        .search-icon { position:absolute; left: 14px; top: 12px; color: var(--dim); }
+        .search-input { width:100%; padding: 12px 14px 12px 44px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; }
+        .notes-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 18px; }
+        .note-card { background: var(--card); border: 1px solid var(--border); padding: 20px; border-radius: 24px; position: relative; }
+        .note-card.pinned { border-top: 5px solid #f97316; }
+        .card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+        .card-actions { display:flex; gap: 8px; }
+        .card-actions button { border:none; background:transparent; cursor:pointer; color: var(--dim); padding: 6px; border-radius: 10px; }
+        .card-actions .text-red { color:#ef4444; }
+        .card-actions .orange-text { color:#f97316; }
+        .card-body { margin: 12px 0 16px; color: var(--dim); white-space: pre-wrap; overflow:hidden; display:-webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; }
+        .card-bottom { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+        .tag-list { display:flex; flex-wrap:wrap; gap: 8px; }
+        .tag-chip { font-size: 11px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--dim); }
+        .copy-action-btn { background: #f97316; color: white; border: none; padding: 10px 14px; border-radius: 12px; font-weight: 800; cursor: pointer; display:flex; align-items:center; gap:10px; }
+        .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #10b981; color: white; padding: 12px 24px; border-radius: 50px; display: flex; align-items: center; gap: 10px; font-weight: 800; animation: slideUp 0.25s; z-index: 2000; }
+        @keyframes slideUp { from { opacity: 0; transform: translate(-50%, 18px); } to { opacity: 1; transform: translate(-50%, 0); } }
+        .overlay { position:fixed; inset:0; background: rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; z-index: 1500; padding: 20px; }
+        .variable-modal { width: 100%; max-width: 520px; background: var(--card); border: 1px solid var(--border); border-radius: 24px; padding: 22px; }
+        .variable-modal h2 { margin: 0 0 14px; }
+        .variable-modal .field { margin-bottom: 12px; }
+        .variable-modal label { display:block; font-size: 12px; font-weight: 800; color:#f97316; margin-bottom: 6px; }
+        .variable-modal input { width:100%; padding: 12px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; }
+        .wide { width:100%; justify-content:center; }
+        .settings-card { background: var(--card); border: 1px solid var(--border); border-radius: 24px; padding: 18px; max-width: 760px; }
+        .setting-item { padding: 14px 6px; }
+        .border-top { border-top: 1px solid var(--border); }
+        .field-label { display:block; font-size: 12px; font-weight: 900; margin-bottom: 10px; }
+        .sig-textarea { width:100%; padding: 12px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; resize: vertical; }
+        .action-row { display:flex; flex-wrap:wrap; gap: 12px; }
+        .cursor-pointer { cursor:pointer; }
       `}</style>
         </div>
     );
