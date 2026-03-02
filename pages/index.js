@@ -5,13 +5,23 @@ import {
     Search, Plus, Copy, Settings as SettingsIcon,
     LayoutDashboard, Bookmark, Trash2, Save, Edit3,
     Sun, Moon, Download, Upload,
-    LogOut, Mail, Lock, Eye, EyeOff, ChevronLeft, ChevronRight, CheckCircle
+    LogOut, Mail, Lock, Eye, EyeOff, ChevronLeft, ChevronRight, CheckCircle, X
 } from 'lucide-react';
 
+/** Extract unique variables from {{ var }} tokens */
 function extractVars(text) {
-    const matches = text.match(/{{\s*([^}]+?)\s*}}/g) ?? [];
+    const matches = text?.match(/{{\s*([^}]+?)\s*}}/g) ?? [];
     const vars = matches.map(m => m.replace(/{{|}}/g, '').trim());
     return Array.from(new Set(vars));
+}
+
+/** Apply variable values; missing becomes [var] */
+function applyVars(text, values) {
+    return String(text ?? '').replace(/{{\s*([^}]+?)\s*}}/g, (_m, rawKey) => {
+        const key = String(rawKey).trim();
+        const v = (values?.[key] ?? '').trim();
+        return v !== '' ? v : `[${key}]`;
+    });
 }
 
 function safeParseJSON(raw) {
@@ -20,14 +30,6 @@ function safeParseJSON(raw) {
     } catch {
         return { ok: false, error: 'Invalid JSON file.' };
     }
-}
-
-function applyVars(text, values) {
-    return text.replace(/{{\s*([^}]+?)\s*}}/g, (_m, rawKey) => {
-        const key = String(rawKey).trim();
-        const v = (values[key] ?? '').trim();
-        return v !== '' ? v : `[${key}]`;
-    });
 }
 
 export default function CannedNotesApp() {
@@ -46,7 +48,7 @@ export default function CannedNotesApp() {
     const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
     const [editingNote, setEditingNote] = useState(null);
 
-    const [activeNoteForVars, setActiveNoteForVars] = useState(null);
+    const [activeNoteForVars, setActiveNoteForVars] = useState(null); // { ...note, vars: [] }
     const [varValues, setVarValues] = useState({});
 
     const [signature, setSignature] = useState('');
@@ -56,7 +58,9 @@ export default function CannedNotesApp() {
     const toastTimer = useRef(null);
 
     const [isSavingSig, setIsSavingSig] = useState(false);
+    const [isSavingNote, setIsSavingNote] = useState(false);
 
+    // ---------------- INIT ----------------
     useEffect(() => {
         setMounted(true);
 
@@ -64,8 +68,7 @@ export default function CannedNotesApp() {
         setIsDark(localDark);
 
         supabase.auth.getSession().then(({ data, error }) => {
-            if (error) return;
-            setUser(data.session?.user ?? null);
+            if (!error) setUser(data.session?.user ?? null);
         });
 
         const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -112,6 +115,7 @@ export default function CannedNotesApp() {
         setSignature(sigData?.content ?? '');
     };
 
+    // ---------------- AUTH ----------------
     const handleLogin = async (e) => {
         e.preventDefault();
         const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
@@ -125,19 +129,20 @@ export default function CannedNotesApp() {
         setView('notes');
     };
 
+    // ---------------- THEME ----------------
     const toggleDarkMode = () => {
         const newDark = !isDark;
         setIsDark(newDark);
         localStorage.setItem('dark_mode', String(newDark));
     };
 
+    // ---------------- EXPORT / IMPORT ----------------
     const exportData = () => {
         const payload = {
             exported_at: new Date().toISOString(),
             notes,
             signature,
         };
-
         const dataStr = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(payload, null, 2));
         const a = document.createElement('a');
         a.href = dataStr;
@@ -184,7 +189,9 @@ export default function CannedNotesApp() {
 
             const sig = typeof parsed.value?.signature === 'string' ? parsed.value.signature : null;
             if (sig !== null) {
-                await supabase.from('signatures').upsert({ user_id: user.id, content: sig }, { onConflict: 'user_id' });
+                await supabase
+                    .from('signatures')
+                    .upsert({ user_id: user.id, content: sig }, { onConflict: 'user_id' });
             }
 
             await fetchData();
@@ -195,6 +202,97 @@ export default function CannedNotesApp() {
         reader.readAsText(file);
     };
 
+    // ---------------- NOTES CRUD ----------------
+    const openNewNote = () => {
+        setEditingNote(null);
+        setIsDrawerOpen(true);
+    };
+
+    const openEditNote = (note) => {
+        setEditingNote(note);
+        setIsDrawerOpen(true);
+    };
+
+    const closeDrawer = () => {
+        setIsDrawerOpen(false);
+        setEditingNote(null);
+    };
+
+    const handleSaveNote = async (e) => {
+        e.preventDefault();
+        if (!user?.id) return;
+
+        setIsSavingNote(true);
+
+        const formData = new FormData(e.currentTarget);
+        const title = String(formData.get('title') ?? '').trim();
+        const content = String(formData.get('content') ?? '');
+        const tagsRaw = String(formData.get('tags') ?? '');
+
+        const noteData = {
+            title,
+            content,
+            tags: tagsRaw.split(',').map(t => t.trim()).filter(Boolean),
+            user_id: user.id,
+        };
+
+        try {
+            if (!title) {
+                alert('Title is required.');
+                return;
+            }
+
+            if (editingNote) {
+                const { error } = await supabase
+                    .from('notes')
+                    .update(noteData)
+                    .eq('id', editingNote.id)
+                    .eq('user_id', user.id);
+
+                if (error) throw error;
+            } else {
+                const { error } = await supabase
+                    .from('notes')
+                    .insert([{ ...noteData, is_pinned: false, usage_count: 0 }]);
+
+                if (error) throw error;
+            }
+
+            closeDrawer();
+            await fetchData();
+        } catch (err) {
+            console.error(err);
+            alert(`Save failed: ${err?.message ?? 'Unknown error'}`);
+        } finally {
+            setIsSavingNote(false);
+        }
+    };
+
+    const togglePin = async (note) => {
+        const { error } = await supabase
+            .from('notes')
+            .update({ is_pinned: !note.is_pinned })
+            .eq('id', note.id)
+            .eq('user_id', user.id);
+
+        if (error) return alert(`Pin failed: ${error.message}`);
+        await fetchData();
+    };
+
+    const deleteNote = async (note) => {
+        if (!confirm('Delete this template?')) return;
+
+        const { error } = await supabase
+            .from('notes')
+            .delete()
+            .eq('id', note.id)
+            .eq('user_id', user.id);
+
+        if (error) return alert(`Delete failed: ${error.message}`);
+        await fetchData();
+    };
+
+    // ---------------- COPY FLOW ----------------
     const handleCopyRequest = (note) => {
         const vars = extractVars(note.content);
         if (vars.length > 0) {
@@ -213,7 +311,7 @@ export default function CannedNotesApp() {
 
         const { error } = await supabase
             .from('notes')
-            .update({ usage_count: currentCount + 1 })
+            .update({ usage_count: (currentCount ?? 0) + 1 })
             .eq('id', noteId)
             .eq('user_id', user.id);
 
@@ -228,6 +326,7 @@ export default function CannedNotesApp() {
         await fetchData();
     };
 
+    // ---------------- DERIVED LIST ----------------
     const filteredNotes = useMemo(() => {
         const q = search.trim().toLowerCase();
 
@@ -242,6 +341,7 @@ export default function CannedNotesApp() {
 
     if (!mounted) return null;
 
+    // ---------------- AUTH VIEW ----------------
     if (!user) {
         return (
             <div className={`auth-page ${isDark ? 'dark' : ''}`}>
@@ -278,21 +378,22 @@ export default function CannedNotesApp() {
                 </div>
 
                 <style jsx>{`
-          .auth-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); padding: 40px 20px; box-sizing: border-box; }
+          .auth-page { min-height: 100vh; display:flex; align-items:center; justify-content:center; background: var(--bg); padding: 40px 20px; box-sizing:border-box; }
           .auth-card { background: var(--side); padding: 50px 40px; border-radius: 32px; width: 100%; max-width: 400px; border: 1px solid var(--border); text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
           .auth-logo { font-size: 28px; font-weight: 900; margin-bottom: 8px; font-style: italic; }
           .auth-logo span { color: #f97316; }
-          .auth-form { display: flex; flex-direction: column; gap: 20px; text-align: left; margin-top: 30px; }
-          .field label { display: block; font-size: 11px; font-weight: 700; color: #f97316; text-transform: uppercase; margin-bottom: 8px; }
-          .field input { width: 100%; padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline: none; }
+          .auth-form { display:flex; flex-direction:column; gap: 20px; text-align:left; margin-top: 30px; }
+          .field label { display:block; font-size: 11px; font-weight: 700; color: #f97316; text-transform: uppercase; margin-bottom: 8px; }
+          .field input { width: 100%; padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; box-sizing:border-box; }
           .password-wrapper { position: relative; }
           .eye-btn { position: absolute; right: 12px; top: 12px; background: none; border: none; color: var(--dim); cursor: pointer; }
-          .login-submit-btn { background: #f97316; color: white; border: none; padding: 16px; border-radius: 14px; font-weight: 700; cursor: pointer; margin-top: 10px; }
+          .login-submit-btn { background:#f97316; color:white; border:none; padding: 16px; border-radius: 14px; font-weight: 700; cursor:pointer; margin-top: 10px; }
         `}</style>
             </div>
         );
     }
 
+    // ---------------- MAIN APP ----------------
     return (
         <div className={`app-wrapper ${isDark ? 'dark' : ''}`}>
             <Head><title>Snip & Done</title></Head>
@@ -345,7 +446,12 @@ export default function CannedNotesApp() {
                         <div className="settings-card">
                             <div className="setting-item">
                                 <label className="field-label">Universal Signature</label>
-                                <textarea className="sig-textarea" value={signature} onChange={(e) => setSignature(e.target.value)} rows={6} />
+                                <textarea
+                                    className="sig-textarea"
+                                    value={signature}
+                                    onChange={(e) => setSignature(e.target.value)}
+                                    rows={6}
+                                />
 
                                 <button
                                     className="primary-btn"
@@ -380,7 +486,7 @@ export default function CannedNotesApp() {
                     <div className="view-animate">
                         <header className="main-header">
                             <h1 className="view-title">{view.toUpperCase()} <span className="orange-text">SNIPPETS</span></h1>
-                            <button className="primary-btn" onClick={() => { setEditingNote(null); setIsDrawerOpen(true); }}>
+                            <button className="primary-btn" onClick={openNewNote}>
                                 <Plus size={20} /> New Template
                             </button>
                         </header>
@@ -401,36 +507,15 @@ export default function CannedNotesApp() {
                                     <div className="card-top">
                                         <h3>{note.title}</h3>
                                         <div className="card-actions">
-                                            <button
-                                                onClick={async () => {
-                                                    const { error } = await supabase
-                                                        .from('notes')
-                                                        .update({ is_pinned: !note.is_pinned })
-                                                        .eq('id', note.id)
-                                                        .eq('user_id', user.id);
-                                                    if (error) return alert(`Pin failed: ${error.message}`);
-                                                    await fetchData();
-                                                }}
-                                                className={note.is_pinned ? 'orange-text' : ''}
-                                                title="Toggle favorite"
-                                            >
+                                            <button onClick={() => togglePin(note)} className={note.is_pinned ? 'orange-text' : ''} title="Toggle favorite">
                                                 <Bookmark size={16} />
                                             </button>
 
-                                            <button onClick={() => { setEditingNote(note); setIsDrawerOpen(true); }} title="Edit">
+                                            <button onClick={() => openEditNote(note)} title="Edit">
                                                 <Edit3 size={16} />
                                             </button>
 
-                                            <button
-                                                onClick={async () => {
-                                                    if (!confirm('Delete?')) return;
-                                                    const { error } = await supabase.from('notes').delete().eq('id', note.id).eq('user_id', user.id);
-                                                    if (error) return alert(`Delete failed: ${error.message}`);
-                                                    await fetchData();
-                                                }}
-                                                className="text-red"
-                                                title="Delete"
-                                            >
+                                            <button onClick={() => deleteNote(note)} className="text-red" title="Delete">
                                                 <Trash2 size={16} />
                                             </button>
                                         </div>
@@ -453,10 +538,11 @@ export default function CannedNotesApp() {
                 )}
             </main>
 
+            {/* VARIABLES MODAL */}
             {activeNoteForVars && (
-                <div className="overlay">
-                    <div className="variable-modal">
-                        <h2>Complete Variables</h2>
+                <div className="overlay" onClick={() => { setActiveNoteForVars(null); setVarValues({}); }}>
+                    <div className="variable-modal" onClick={(e) => e.stopPropagation()}>
+                        <h2 style={{ marginTop: 0 }}>Complete Variables</h2>
                         {activeNoteForVars.vars.map((v, i) => (
                             <div key={v} className="field">
                                 <label>{v}</label>
@@ -477,64 +563,143 @@ export default function CannedNotesApp() {
                 </div>
             )}
 
+            {/* NOTE DRAWER */}
+            {isDrawerOpen && (
+                <div className="overlay" onClick={closeDrawer}>
+                    <div className="variable-modal" onClick={(e) => e.stopPropagation()}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                            <h2 style={{ margin: 0 }}>{editingNote ? 'Edit Template' : 'New Template'}</h2>
+                            <button className="icon-btn" onClick={closeDrawer} type="button" title="Close">
+                                <X size={18} />
+                            </button>
+                        </div>
+
+                        <form onSubmit={handleSaveNote} style={{ marginTop: 12 }}>
+                            <div className="field">
+                                <label>Title</label>
+                                <input name="title" defaultValue={editingNote?.title ?? ''} required />
+                            </div>
+
+                            <div className="field">
+                                <label>Tags (comma separated)</label>
+                                <input
+                                    name="tags"
+                                    defaultValue={(editingNote?.tags ?? []).join(', ')}
+                                    placeholder="e.g. onboarding, billing, follow-up"
+                                />
+                            </div>
+
+                            <div className="field">
+                                <label>Content</label>
+                                <textarea
+                                    name="content"
+                                    rows={10}
+                                    defaultValue={editingNote?.content ?? ''}
+                                    placeholder="Use variables like {{customer_name}}"
+                                    required
+                                />
+                            </div>
+
+                            <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+                                <button type="button" className="outline-btn" onClick={closeDrawer}>Cancel</button>
+                                <button type="submit" className="primary-btn" disabled={isSavingNote}>
+                                    <Save size={18} /> {isSavingNote ? 'Saving...' : 'Save'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+
+            {/* TOAST */}
             {showToast && <div className="toast"><CheckCircle size={16} /> Copied to clipboard! 🍊</div>}
 
             <style jsx global>{`
         :root { --bg: #fffaf5; --side: #ffffff; --card: #ffffff; --text: #2d3748; --dim: #718096; --border: #edf2f7; --in: #ffffff; }
         .dark { --bg: #0b0e14; --side: #151921; --card: #1c212c; --text: #e2e8f0; --dim: #94a3b8; --border: #2d3748; --in: #0b0e14; }
         body { margin: 0; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); }
+
         .sidebar { width: 260px; height: 100vh; position: fixed; background: var(--side); border-right: 1px solid var(--border); padding: 25px; transition: 0.3s; z-index: 100; }
         .sidebar.collapsed { width: 80px; padding: 25px 10px; }
+
         .logo-container { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom: 40px; }
         .logo { font-weight: 900; font-size: 22px; color: #f97316; font-style: italic; }
         .logo span { color: #111827; }
         .dark .logo span { color: #e2e8f0; }
+
         .collapse-toggle { border:none; background:transparent; cursor:pointer; color: var(--dim); padding: 8px; border-radius: 10px; }
         .nav-group { display: flex; flex-direction: column; gap: 10px; }
         .nav-divider { height:1px; background: var(--border); margin: 8px 0; }
+
         .nav-btn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px; border: none; background: transparent; border-radius: 12px; cursor: pointer; color: var(--dim); font-weight: 700; }
         .nav-btn.active { color: white; background: #f97316; }
         .logout-red { color: #ef4444; margin-top: 20px; }
+
         .main-content { margin-left: 260px; padding: 60px; transition: 0.3s; }
         .main-content.expanded { margin-left: 80px; }
+
         .main-header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom: 18px; }
         .view-title { margin: 0; font-size: 28px; letter-spacing: 0.5px; }
         .orange-text { color:#f97316; }
+
         .primary-btn { background: #f97316; color: white; border: none; padding: 12px 16px; border-radius: 14px; font-weight: 800; cursor: pointer; display:flex; align-items:center; gap:10px; }
         .primary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .outline-btn { border: 2px solid var(--border); background: transparent; color: var(--text); padding: 12px 16px; border-radius: 14px; font-weight: 800; cursor: pointer; display:flex; align-items:center; gap:10px; }
+        .cursor-pointer { cursor: pointer; }
+
+        .icon-btn { border: 1px solid var(--border); background: transparent; color: var(--text); width: 36px; height: 36px; border-radius: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; }
+
         .search-box { position: relative; margin: 18px 0 26px; }
         .search-icon { position:absolute; left: 14px; top: 12px; color: var(--dim); }
         .search-input { width:100%; padding: 12px 14px 12px 44px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; }
+
         .notes-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 18px; }
         .note-card { background: var(--card); border: 1px solid var(--border); padding: 20px; border-radius: 24px; position: relative; }
         .note-card.pinned { border-top: 5px solid #f97316; }
+
         .card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
         .card-actions { display:flex; gap: 8px; }
         .card-actions button { border:none; background:transparent; cursor:pointer; color: var(--dim); padding: 6px; border-radius: 10px; }
         .card-actions .text-red { color:#ef4444; }
         .card-actions .orange-text { color:#f97316; }
+
         .card-body { margin: 12px 0 16px; color: var(--dim); white-space: pre-wrap; overflow:hidden; display:-webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; }
         .card-bottom { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+
         .tag-list { display:flex; flex-wrap:wrap; gap: 8px; }
         .tag-chip { font-size: 11px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--dim); }
+
         .copy-action-btn { background: #f97316; color: white; border: none; padding: 10px 14px; border-radius: 12px; font-weight: 800; cursor: pointer; display:flex; align-items:center; gap:10px; }
+
         .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #10b981; color: white; padding: 12px 24px; border-radius: 50px; display: flex; align-items: center; gap: 10px; font-weight: 800; animation: slideUp 0.25s; z-index: 2000; }
         @keyframes slideUp { from { opacity: 0; transform: translate(-50%, 18px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
         .overlay { position:fixed; inset:0; background: rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; z-index: 1500; padding: 20px; }
+
         .variable-modal { width: 100%; max-width: 520px; background: var(--card); border: 1px solid var(--border); border-radius: 24px; padding: 22px; }
         .variable-modal h2 { margin: 0 0 14px; }
-        .variable-modal .field { margin-bottom: 12px; }
-        .variable-modal label { display:block; font-size: 12px; font-weight: 800; color:#f97316; margin-bottom: 6px; }
-        .variable-modal input { width:100%; padding: 12px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; }
+        .field { margin-bottom: 12px; }
+        .field label { display:block; font-size: 12px; font-weight: 800; color:#f97316; margin-bottom: 6px; }
+        .variable-modal input, .variable-modal textarea {
+          width:100%;
+          padding: 12px;
+          border-radius: 14px;
+          border: 2px solid var(--border);
+          background: var(--in);
+          color: var(--text);
+          outline:none;
+          box-sizing:border-box;
+          font-family: inherit;
+        }
+        .variable-modal textarea { resize: vertical; }
         .wide { width:100%; justify-content:center; }
+
         .settings-card { background: var(--card); border: 1px solid var(--border); border-radius: 24px; padding: 18px; max-width: 760px; }
         .setting-item { padding: 14px 6px; }
-        .border-top { border-top: 1px solid var(--border); }
+        .border-top { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 18px; }
         .field-label { display:block; font-size: 12px; font-weight: 900; margin-bottom: 10px; }
-        .sig-textarea { width:100%; padding: 12px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; resize: vertical; }
+        .sig-textarea { width:100%; padding: 12px; border-radius: 14px; border: 2px solid var(--border); background: var(--in); color: var(--text); outline:none; resize: vertical; box-sizing:border-box; }
         .action-row { display:flex; flex-wrap:wrap; gap: 12px; }
-        .cursor-pointer { cursor:pointer; }
       `}</style>
         </div>
     );
