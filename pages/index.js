@@ -60,6 +60,42 @@ export default function CannedNotesApp() {
     const [isSavingSig, setIsSavingSig] = useState(false);
     const [isSavingNote, setIsSavingNote] = useState(false);
 
+    const [isQuickEmailOpen, setIsQuickEmailOpen] = useState(false);
+    const [quickCustomerName, setQuickCustomerName] = useState('');
+    const [quickBody, setQuickBody] = useState('');
+    const openQuickEmail = () => {
+        setQuickCustomerName('');
+        setQuickBody('');
+        setIsQuickEmailOpen(true);
+    };
+
+    const closeQuickEmail = () => {
+        setIsQuickEmailOpen(false);
+        setQuickCustomerName('');
+        setQuickBody('');
+    };
+
+    const buildQuickEmailText = () => {
+        const name = quickCustomerName.trim() || 'Customer';
+        const body = quickBody.trim();
+
+        // exact requirement: "Hi {{Customer Name}}," + signature attached
+        // we’ll replace placeholder with typed name at copy-time
+        const greeting = `Hi ${name},`;
+
+        return `${greeting}\n\n${body}\n\n${signature}`.trim();
+    };
+
+    const copyQuickEmail = async () => {
+        const full = buildQuickEmailText();
+        await navigator.clipboard.writeText(full);
+
+        setShowToast(true);
+        if (toastTimer.current) window.clearTimeout(toastTimer.current);
+        toastTimer.current = window.setTimeout(() => setShowToast(false), 2000);
+
+        closeQuickEmail();
+    };
     // ---------------- INIT ----------------
     useEffect(() => {
         setMounted(true);
@@ -486,9 +522,15 @@ export default function CannedNotesApp() {
                     <div className="view-animate">
                         <header className="main-header">
                             <h1 className="view-title">{view.toUpperCase()} <span className="orange-text">SNIPPETS</span></h1>
-                            <button className="primary-btn" onClick={openNewNote}>
-                                <Plus size={20} /> New Template
-                            </button>
+                            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                                <button className="outline-btn" onClick={openQuickEmail}>
+                                    <Mail size={18} /> Quick Email
+                                </button>
+
+                                <button className="primary-btn" onClick={openNewNote}>
+                                    <Plus size={20} /> New Template
+                                </button>
+                            </div>
                         </header>
 
                         <div className="search-box">
@@ -610,7 +652,55 @@ export default function CannedNotesApp() {
                     </div>
                 </div>
             )}
+            {/* QUICK EMAIL MODAL */}
+            {isQuickEmailOpen && (
+                <div className="overlay" onClick={closeQuickEmail}>
+                    <div className="variable-modal" onClick={(e) => e.stopPropagation()}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                            <h2 style={{ margin: 0 }}>Quick Email</h2>
+                            <button className="icon-btn" onClick={closeQuickEmail} type="button" title="Close">
+                                <X size={18} />
+                            </button>
+                        </div>
 
+                        <div style={{ marginTop: 12 }}>
+                            <div className="field">
+                                <label>Customer Name</label>
+                                <input
+                                    value={quickCustomerName}
+                                    onChange={(e) => setQuickCustomerName(e.target.value)}
+                                    placeholder="e.g. John"
+                                />
+                            </div>
+
+                            <div className="field">
+                                <label>Email Body</label>
+                                <textarea
+                                    rows={10}
+                                    value={quickBody}
+                                    onChange={(e) => setQuickBody(e.target.value)}
+                                    placeholder="Type your email message here..."
+                                />
+                            </div>
+
+                            <div className="field">
+                                <label>Preview</label>
+                                <textarea rows={8} value={buildQuickEmailText()} readOnly />
+                            </div>
+
+                            <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+                                <button type="button" className="outline-btn" onClick={closeQuickEmail}>
+                                    Cancel
+                                </button>
+
+                                <button type="button" className="primary-btn" onClick={copyQuickEmail}>
+                                    <Copy size={18} /> Copy Full Email
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
             {/* TOAST */}
             {showToast && <div className="toast"><CheckCircle size={16} /> Copied to clipboard! 🍊</div>}
 
