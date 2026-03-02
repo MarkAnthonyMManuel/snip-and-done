@@ -60,6 +60,39 @@ export default function CannedNotesApp() {
     const [isSavingSig, setIsSavingSig] = useState(false);
     const [isSavingNote, setIsSavingNote] = useState(false);
 
+    // ✅ NEW: refs for variable inputs (Enter to next)
+    const varInputRefs = useRef([]);
+
+    // ✅ NEW: close helper for vars modal
+    const closeVarsModal = () => {
+        setActiveNoteForVars(null);
+        setVarValues({});
+    };
+
+    // ✅ NEW: key handler (Enter = next/finalize, Esc = close)
+    const handleVarKeyDown = (e, index) => {
+        if (!activeNoteForVars) return;
+
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            closeVarsModal();
+            return;
+        }
+
+        if (e.key === 'Enter') {
+            e.preventDefault();
+
+            const isLast = index === activeNoteForVars.vars.length - 1;
+
+            if (!isLast) {
+                varInputRefs.current[index + 1]?.focus();
+                return;
+            }
+
+            finalizeCopy(activeNoteForVars.id, activeNoteForVars.content, activeNoteForVars.usage_count ?? 0);
+        }
+    };
+
     const [isQuickEmailOpen, setIsQuickEmailOpen] = useState(false);
     const [quickCustomerName, setQuickCustomerName] = useState('');
     const [quickBody, setQuickBody] = useState('');
@@ -78,11 +111,7 @@ export default function CannedNotesApp() {
     const buildQuickEmailText = () => {
         const name = quickCustomerName.trim() || 'Customer';
         const body = quickBody.trim();
-
-        // exact requirement: "Hi {{Customer Name}}," + signature attached
-        // we’ll replace placeholder with typed name at copy-time
         const greeting = `Hi ${name},`;
-
         return `${greeting}\n\n${body}\n\n${signature}`.trim();
     };
 
@@ -96,6 +125,7 @@ export default function CannedNotesApp() {
 
         closeQuickEmail();
     };
+
     // ---------------- INIT ----------------
     useEffect(() => {
         setMounted(true);
@@ -334,6 +364,8 @@ export default function CannedNotesApp() {
         if (vars.length > 0) {
             setActiveNoteForVars({ ...note, vars });
             setVarValues({});
+            // ✅ NEW: reset refs array so focus chaining is clean
+            varInputRefs.current = [];
         } else {
             void finalizeCopy(note.id, note.content, note.usage_count ?? 0);
         }
@@ -357,8 +389,8 @@ export default function CannedNotesApp() {
         if (toastTimer.current) window.clearTimeout(toastTimer.current);
         toastTimer.current = window.setTimeout(() => setShowToast(false), 2000);
 
-        setActiveNoteForVars(null);
-        setVarValues({});
+        // ✅ NEW: use the close helper
+        closeVarsModal();
         await fetchData();
     };
 
@@ -580,27 +612,45 @@ export default function CannedNotesApp() {
                 )}
             </main>
 
-            {/* VARIABLES MODAL */}
+            {/* VARIABLES MODAL ✅ UPDATED */}
             {activeNoteForVars && (
-                <div className="overlay" onClick={() => { setActiveNoteForVars(null); setVarValues({}); }}>
+                <div className="overlay" onClick={closeVarsModal}>
                     <div className="variable-modal" onClick={(e) => e.stopPropagation()}>
-                        <h2 style={{ marginTop: 0 }}>Complete Variables</h2>
-                        {activeNoteForVars.vars.map((v, i) => (
-                            <div key={v} className="field">
-                                <label>{v}</label>
-                                <input
-                                    autoFocus={i === 0}
-                                    value={varValues[v] ?? ''}
-                                    onChange={(e) => setVarValues(prev => ({ ...prev, [v]: e.target.value }))}
-                                />
-                            </div>
-                        ))}
-                        <button
-                            className="primary-btn wide"
-                            onClick={() => finalizeCopy(activeNoteForVars.id, activeNoteForVars.content, activeNoteForVars.usage_count ?? 0)}
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                            <h2 style={{ margin: 0 }}>Complete Variables</h2>
+                            <button className="icon-btn" type="button" onClick={closeVarsModal} title="Close (Esc)">
+                                <X size={18} />
+                            </button>
+                        </div>
+
+                        <form
+                            onSubmit={(e) => {
+                                e.preventDefault();
+                                finalizeCopy(activeNoteForVars.id, activeNoteForVars.content, activeNoteForVars.usage_count ?? 0);
+                            }}
+                            style={{ marginTop: 12 }}
                         >
-                            Finalize & Copy
-                        </button>
+                            {activeNoteForVars.vars.map((v, i) => (
+                                <div key={v} className="field">
+                                    <label>{v}</label>
+                                    <input
+                                        ref={(el) => { varInputRefs.current[i] = el; }}
+                                        autoFocus={i === 0}
+                                        value={varValues[v] ?? ''}
+                                        onChange={(e) => setVarValues(prev => ({ ...prev, [v]: e.target.value }))}
+                                        onKeyDown={(e) => handleVarKeyDown(e, i)}
+                                    />
+                                </div>
+                            ))}
+
+                            <button className="primary-btn wide" type="submit">
+                                Finalize & Copy
+                            </button>
+
+                            <div style={{ marginTop: 10, fontSize: 12, color: 'var(--dim)' }}>
+                                Tip: <b>Enter</b> = next field / finalize • <b>Esc</b> = close
+                            </div>
+                        </form>
                     </div>
                 </div>
             )}
@@ -652,6 +702,7 @@ export default function CannedNotesApp() {
                     </div>
                 </div>
             )}
+
             {/* QUICK EMAIL MODAL */}
             {isQuickEmailOpen && (
                 <div className="overlay" onClick={closeQuickEmail}>
@@ -701,6 +752,7 @@ export default function CannedNotesApp() {
                     </div>
                 </div>
             )}
+
             {/* TOAST */}
             {showToast && <div className="toast"><CheckCircle size={16} /> Copied to clipboard! 🍊</div>}
 
